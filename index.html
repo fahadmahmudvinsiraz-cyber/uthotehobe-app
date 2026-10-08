@@ -3,6 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<script>
+function __banner(t){var d=document.createElement('div');d.style.cssText='position:fixed;left:0;right:0;bottom:0;z-index:99;background:#900;color:#fff;font:12px monospace;padding:8px;white-space:pre-wrap';d.textContent=t;(document.body||document.documentElement).appendChild(d)}
+window.onerror=function(m,u,l,c){__banner('ত্রুটি: '+m+' @'+l+':'+c)};
+setTimeout(function(){if(!window.__ok)__banner('JS চালু হয়নি')},7000);
+</script>
 <title>উঠতেই হবে</title>
 <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
@@ -86,18 +91,20 @@ button:focus-visible,input:focus-visible{outline:3px solid #fff;outline-offset:2
 </section>
 
 <script>
+window.__ok=1;
 const $=id=>document.getElementById(id), bn=n=>String(n).padStart(2,'0').replace(/\d/g,d=>'০১২৩৪৫৬৭৮৯'[d]);
 const CAPS=['ওঠো, আমি তোমাকে দেখছি','এখনো শুয়ে আছো?','ঘুম কে বিদায় দাও','সময় নষ্ট কোরো না, ওঠো!','আমি নিজেই বলেছি: উঠতেই হবে'];
+function show(id){document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('on',s.id===id))}
+function go(){if($('splash').classList.contains('on'))show('home')}
+setTimeout(go,3800); $('splash').addEventListener('click',go);
 let alarm=null, firedKey='', ctx=null, beepTimer=null, capTimer=null, wake=null, ringing=false, vol=.15;
 try{alarm=localStorage.getItem('uth_alarm')}catch(e){}
-const AP=(window.Capacitor&&Capacitor.isNativePlatform&&Capacitor.isNativePlatform())?Capacitor.registerPlugin('AlarmPlugin'):null;
+let AP=null;try{AP=(window.Capacitor&&Capacitor.isNativePlatform&&Capacitor.isNativePlatform())?Capacitor.registerPlugin('AlarmPlugin'):null}catch(e){AP=null}
 function nativeSet(hm){if(AP){const [h,m]=hm.split(':').map(Number);AP.set({hour:h,minute:m}).catch(()=>{})}}
 if(AP)setInterval(()=>AP.pending().then(r=>{if(r.ring&&!ringing)startRing()}).catch(()=>{}),1000);
 if(alarm){$('t').value=alarm; $('status').textContent='এলার্ম সেট আছে: '+alarm}
 
-function show(id){document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('on',s.id===id))}
-function go(){if($('splash').classList.contains('on'))show('home')}
-setTimeout(go,3800); $('splash').addEventListener('click',go);
+
 
 function tick(){
   const d=new Date();
