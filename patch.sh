@@ -24,32 +24,74 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import java.util.Calendar;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 @CapacitorPlugin(name = "AlarmPlugin")
 public class AlarmPlugin extends Plugin {
   static final int NID = 7;
   static final int F = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
 
-  static PendingIntent fire(Context c) {
-    return PendingIntent.getBroadcast(c, 1, new Intent(c, AlarmReceiver.class), F);
+  static AlarmManager am(Context c) { return (AlarmManager) c.getSystemService(Context.ALARM_SERVICE); }
+
+  static PendingIntent show(Context c) {
+    return PendingIntent.getActivity(c, 2, new Intent(c, MainActivity.class), F);
   }
 
-  static void schedule(Context c, int h, int m) {
+  static PendingIntent fire(Context c, int id, int h, int m) {
+    Intent i = new Intent(c, AlarmReceiver.class);
+    i.putExtra("id", id);
+    i.putExtra("h", h);
+    i.putExtra("m", m);
+    return PendingIntent.getBroadcast(c, 100 + id, i, F);
+  }
+
+  static long nextTime(int h, int m) {
     Calendar cal = Calendar.getInstance();
     cal.set(Calendar.HOUR_OF_DAY, h);
     cal.set(Calendar.MINUTE, m);
     cal.set(Calendar.SECOND, 0);
     cal.set(Calendar.MILLISECOND, 0);
     if (cal.getTimeInMillis() <= System.currentTimeMillis()) cal.add(Calendar.DAY_OF_YEAR, 1);
-    AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
-    PendingIntent show = PendingIntent.getActivity(c, 2, new Intent(c, MainActivity.class), F);
-    am.setAlarmClock(new AlarmManager.AlarmClockInfo(cal.getTimeInMillis(), show), fire(c));
-    c.getSharedPreferences("u", 0).edit().putInt("h", h).putInt("m", m).apply();
+    return cal.getTimeInMillis();
   }
 
+  static void schedule(Context c, int id, int h, int m) {
+    am(c).setAlarmClock(new AlarmManager.AlarmClockInfo(nextTime(h, m), show(c)), fire(c, id, h, m));
+  }
+
+  static void each(String json, boolean cancel, Context c) {
+    try {
+      JSONArray a = new JSONArray(json);
+      for (int k = 0; k < a.length(); k++) {
+        JSONObject o = a.getJSONObject(k);
+        int id = o.getInt("id"), h = o.getInt("h"), m = o.getInt("m");
+        if (cancel) am(c).cancel(fire(c, id, h, m));
+        else if (o.optBoolean("on", true)) schedule(c, id, h, m);
+      }
+    } catch (Exception e) { }
+  }
+
+  static PendingIntent chasePi(Context c) {
+    Intent i = new Intent(c, AlarmReceiver.class);
+    i.setAction("CHASE");
+    return PendingIntent.getBroadcast(c, 4, i, F);
+  }
+
+  static void chase(Context c) {
+    am(c).setAlarmClock(new AlarmManager.AlarmClockInfo(System.currentTimeMillis() + 20000, show(c)), chasePi(c));
+  }
+
+  static void stopChase(Context c) { am(c).cancel(chasePi(c)); }
+
   @PluginMethod
-  public void set(PluginCall call) {
-    schedule(getContext(), call.getInt("hour"), call.getInt("minute"));
+  public void setAlarms(PluginCall call) {
+    Context c = getContext();
+    SharedPreferences p = c.getSharedPreferences("u", 0);
+    each(p.getString("alarms", "[]"), true, c);
+    String json = call.getString("json", "[]");
+    p.edit().putString("alarms", json).apply();
+    each(json, false, c);
     call.resolve();
   }
 
@@ -64,6 +106,7 @@ public class AlarmPlugin extends Plugin {
   public void clear(PluginCall call) {
     Context c = getContext();
     c.getSharedPreferences("u", 0).edit().putBoolean("ring", false).apply();
+    stopChase(c);
     ((NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE)).cancel(NID);
     call.resolve();
   }
@@ -82,6 +125,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.media.AudioAttributes;
+import android.media.AudioManager;
 import android.media.RingtoneManager;
 import android.os.Build;
 
@@ -89,8 +133,14 @@ public class AlarmReceiver extends BroadcastReceiver {
   @Override
   public void onReceive(Context c, Intent i) {
     SharedPreferences p = c.getSharedPreferences("u", 0);
+    boolean chase = "CHASE".equals(i.getAction());
+    if (chase && !p.getBoolean("ring", false)) return;
     p.edit().putBoolean("ring", true).apply();
-    AlarmPlugin.schedule(c, p.getInt("h", 5), p.getInt("m", 0));
+    if (!chase) AlarmPlugin.schedule(c, i.getIntExtra("id", 0), i.getIntExtra("h", 5), i.getIntExtra("m", 0));
+    AlarmPlugin.chase(c);
+    AudioManager au = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+    au.setStreamVolume(AudioManager.STREAM_ALARM, au.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0);
+    au.setStreamVolume(AudioManager.STREAM_MUSIC, au.getStreamMaxVolume(AudioManager.STREAM_MUSIC), 0);
     NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
     if (Build.VERSION.SDK_INT >= 26) {
       AudioAttributes a = new AudioAttributes.Builder()
@@ -108,7 +158,7 @@ public class AlarmReceiver extends BroadcastReceiver {
         ? new Notification.Builder(c, "alarm_v1") : new Notification.Builder(c);
     b.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
      .setContentTitle("উঠতেই হবে")
-     .setContentText("ওঠো! টাস্ক শেষ করো")
+     .setContentText("আর কত ঘুমাবি বান্দা? ওঠো, টাস্ক শেষ করো")
      .setCategory(Notification.CATEGORY_ALARM)
      .setPriority(Notification.PRIORITY_MAX)
      .setFullScreenIntent(pi, true)
@@ -121,12 +171,53 @@ public class AlarmReceiver extends BroadcastReceiver {
 }
 EOF
 
+cat > $D/BootReceiver.java <<'EOF'
+package com.fahad.uthotehobe;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import java.util.Calendar;
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+public class BootReceiver extends BroadcastReceiver {
+  @Override
+  public void onReceive(Context c, Intent i) {
+    SharedPreferences p = c.getSharedPreferences("u", 0);
+    String json = p.getString("alarms", "[]");
+    AlarmPlugin.each(json, false, c);
+    try {
+      JSONArray a = new JSONArray(json);
+      long now = System.currentTimeMillis();
+      for (int k = 0; k < a.length(); k++) {
+        JSONObject o = a.getJSONObject(k);
+        if (!o.optBoolean("on", true)) continue;
+        Calendar cal = Calendar.getInstance();
+        cal.set(Calendar.HOUR_OF_DAY, o.getInt("h"));
+        cal.set(Calendar.MINUTE, o.getInt("m"));
+        cal.set(Calendar.SECOND, 0);
+        long t = cal.getTimeInMillis();
+        if (t <= now && now - t < 3600000) p.edit().putBoolean("ring", true).apply();
+      }
+    } catch (Exception e) { }
+    if (p.getBoolean("ring", false)) AlarmPlugin.chase(c);
+  }
+}
+EOF
+
 cat > $D/MainActivity.java <<'EOF'
 package com.fahad.uthotehobe;
 
 import android.Manifest;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.view.WindowManager;
 import androidx.core.app.ActivityCompat;
 import com.getcapacitor.BridgeActivity;
@@ -145,6 +236,14 @@ public class MainActivity extends BridgeActivity {
         ? new String[]{Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.CAMERA}
         : new String[]{Manifest.permission.CAMERA};
     ActivityCompat.requestPermissions(this, perms, 1);
+    SharedPreferences sp = getSharedPreferences("u", 0);
+    PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+    if (Build.VERSION.SDK_INT >= 23 && !pm.isIgnoringBatteryOptimizations(getPackageName()) && !sp.getBoolean("askedBat", false)) {
+      sp.edit().putBoolean("askedBat", true).apply();
+      try {
+        startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())));
+      } catch (Exception e) { }
+    }
   }
 }
 EOF
@@ -156,13 +255,17 @@ perms='''<uses-permission android:name="android.permission.CAMERA"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.VIBRATE"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <uses-feature android:name="android.hardware.camera" android:required="false"/>
     '''
 s=s.replace('<application',perms+'<application',1)
-s=s.replace('</application>','<receiver android:name=".AlarmReceiver" android:exported="false"/>\n    </application>',1)
+s=s.replace('</application>','<receiver android:name=".AlarmReceiver" android:exported="false"/>\n    <receiver android:name=".BootReceiver" android:exported="true"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/></intent-filter></receiver>\n    </application>',1)
 s=s.replace('android:name=".MainActivity"','android:name=".MainActivity" android:showWhenLocked="true" android:turnScreenOn="true"',1)
 open(p,'w',encoding='utf-8').write(s)
 PY
+
 # ---- app icon ----
 python3 -c "import PIL" 2>/dev/null || pip install -q --break-system-packages pillow
 python3 - <<'PY'
