@@ -1,11 +1,24 @@
 set -e
 mkdir -p www && cp index.html www/
+sed -i "s/__BUILD__/${GITHUB_RUN_NUMBER:-0}/" www/index.html
 npm init -y >/dev/null
 npm i @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
 cat > capacitor.config.json <<'EOF'
 {"appId":"com.fahad.uthotehobe","appName":"উঠতেই হবে","webDir":"www"}
 EOF
 npx cap add android
+sed -E -i "s/versionCode [0-9]+/versionCode ${GITHUB_RUN_NUMBER:-1}/; s/versionName \"[^\"]*\"/versionName \"1.${GITHUB_RUN_NUMBER:-0}\"/" android/app/build.gradle
+cat >> android/app/build.gradle <<'EOF'
+
+if (System.getenv("KEYSTORE_PATH")) {
+    def sc = android.signingConfigs.getByName("debug")
+    sc.storeFile = file(System.getenv("KEYSTORE_PATH"))
+    sc.storePassword = "uthote2026"
+    sc.keyAlias = "uthote"
+    sc.keyPassword = "uthote2026"
+    sc.storeType = "pkcs12"
+}
+EOF
 D=android/app/src/main/java/com/fahad/uthotehobe
 mkdir -p $D
 
@@ -18,7 +31,10 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import com.getcapacitor.JSArray;
+import android.net.Uri;
+import android.os.Build;
+import android.os.PowerManager;
+import android.provider.Settings;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -33,75 +49,144 @@ public class AlarmPlugin extends Plugin {
   static final int NID = 7;
   static final int F = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
 
-  static PendingIntent fire(Context c, int id) {
-    Intent i = new Intent(c, AlarmReceiver.class);
-    i.putExtra("id", id);
-    return PendingIntent.getBroadcast(c, 1000 + id, i, F);
+  static void keep(Context c, boolean on) {
+    try {
+      Intent i = new Intent(c, KeepAliveService.class);
+      if (on) {
+        if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(i);
+        else c.startService(i);
+      } else {
+        c.stopService(i);
+      }
+    } catch (Exception e) { }
   }
 
-  static void schedule(Context c, int id, int h, int m) {
+  static AlarmManager am(Context c) { return (AlarmManager) c.getSystemService(Context.ALARM_SERVICE); }
+
+  static PendingIntent show(Context c) {
+    return PendingIntent.getActivity(c, 2, new Intent(c, MainActivity.class), F);
+  }
+
+  static PendingIntent fire(Context c, int id, int h, int m) {
+    Intent i = new Intent(c, AlarmReceiver.class);
+    i.putExtra("id", id);
+    i.putExtra("h", h);
+    i.putExtra("m", m);
+    return PendingIntent.getBroadcast(c, 100 + id, i, F);
+  }
+
+  static long nextTime(int h, int m) {
     Calendar cal = Calendar.getInstance();
     cal.set(Calendar.HOUR_OF_DAY, h);
     cal.set(Calendar.MINUTE, m);
     cal.set(Calendar.SECOND, 0);
     cal.set(Calendar.MILLISECOND, 0);
     if (cal.getTimeInMillis() <= System.currentTimeMillis()) cal.add(Calendar.DAY_OF_YEAR, 1);
-    AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
-    PendingIntent show = PendingIntent.getActivity(c, 2, new Intent(c, MainActivity.class), F);
-    am.setAlarmClock(new AlarmManager.AlarmClockInfo(cal.getTimeInMillis(), show), fire(c, id));
+    return cal.getTimeInMillis();
   }
 
-  static void cancel(Context c, int id) {
-    AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
-    am.cancel(fire(c, id));
+  static void schedule(Context c, int id, int h, int m) {
+    am(c).setAlarmClock(new AlarmManager.AlarmClockInfo(nextTime(h, m), show(c)), fire(c, id, h, m));
   }
 
-  static JSONArray load(Context c) {
+  static void each(String json, boolean cancel, Context c) {
     try {
-      return new JSONArray(c.getSharedPreferences("u", 0).getString("alarms", "[]"));
-    } catch (Exception e) {
-      return new JSONArray();
-    }
+      JSONArray a = new JSONArray(json);
+      for (int k = 0; k < a.length(); k++) {
+        JSONObject o = a.getJSONObject(k);
+        int id = o.getInt("id"), h = o.getInt("h"), m = o.getInt("m");
+        if (cancel) am(c).cancel(fire(c, id, h, m));
+        else if (o.optBoolean("on", true)) schedule(c, id, h, m);
+      }
+    } catch (Exception e) { }
   }
 
-  static void scheduleAll(Context c) {
-    JSONArray a = load(c);
-    for (int i = 0; i < a.length(); i++) {
-      JSONObject o = a.optJSONObject(i);
-      if (o != null && o.optBoolean("on", true)) schedule(c, o.optInt("id"), o.optInt("hour"), o.optInt("minute"));
-    }
+  static PendingIntent chasePi(Context c) {
+    Intent i = new Intent(c, AlarmReceiver.class);
+    i.setAction("CHASE");
+    return PendingIntent.getBroadcast(c, 4, i, F);
   }
 
-  // একটি অ্যালার্ম বাজার পর পরের দিনের জন্য আবার সেট করা
-  static void rearm(Context c, int id) {
-    JSONArray a = load(c);
-    for (int i = 0; i < a.length(); i++) {
-      JSONObject o = a.optJSONObject(i);
-      if (o != null && o.optInt("id") == id && o.optBoolean("on", true)) schedule(c, id, o.optInt("hour"), o.optInt("minute"));
-    }
+  static void chase(Context c) {
+    am(c).setAlarmClock(new AlarmManager.AlarmClockInfo(System.currentTimeMillis() + 20000, show(c)), chasePi(c));
+  }
+
+  static void stopChase(Context c) { am(c).cancel(chasePi(c)); }
+
+  @PluginMethod
+  public void setAlarms(PluginCall call) {
+    Context c = getContext();
+    SharedPreferences p = c.getSharedPreferences("u", 0);
+    each(p.getString("alarms", "[]"), true, c);
+    String json = call.getString("json", "[]");
+    p.edit().putString("alarms", json).putLong("lastReg", System.currentTimeMillis()).apply();
+    each(json, false, c);
+    keep(c, json.contains("\"on\":true"));
+    call.resolve();
   }
 
   @PluginMethod
-  public void sync(PluginCall call) {
+  public void status(PluginCall call) {
     Context c = getContext();
-    JSONArray old = load(c);
-    for (int i = 0; i < old.length(); i++) {
-      JSONObject o = old.optJSONObject(i);
-      if (o != null) cancel(c, o.optInt("id"));
-    }
-    JSArray arr = call.getArray("alarms");
-    if (arr == null) arr = new JSArray();
-    c.getSharedPreferences("u", 0).edit().putString("alarms", arr.toString()).apply();
-    scheduleAll(c);
+    SharedPreferences p = c.getSharedPreferences("u", 0);
+    int total = 0, alive = 0;
+    try {
+      JSONArray a = new JSONArray(p.getString("alarms", "[]"));
+      for (int k = 0; k < a.length(); k++) {
+        JSONObject j = a.getJSONObject(k);
+        if (!j.optBoolean("on", true)) continue;
+        total++;
+        Intent i = new Intent(c, AlarmReceiver.class);
+        i.putExtra("id", j.getInt("id"));
+        i.putExtra("h", j.getInt("h"));
+        i.putExtra("m", j.getInt("m"));
+        PendingIntent pi = PendingIntent.getBroadcast(c, 100 + j.getInt("id"), i,
+            PendingIntent.FLAG_NO_CREATE | PendingIntent.FLAG_IMMUTABLE);
+        if (pi != null) alive++;
+      }
+    } catch (Exception e) { }
+    NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+    boolean full = true;
+    if (Build.VERSION.SDK_INT >= 34) full = nm.canUseFullScreenIntent();
+    PowerManager pm = (PowerManager) c.getSystemService(Context.POWER_SERVICE);
+    JSObject o = new JSObject();
+    o.put("total", total);
+    o.put("alive", alive);
+    o.put("notif", nm.areNotificationsEnabled());
+    o.put("full", full);
+    o.put("battery", Build.VERSION.SDK_INT < 23 || pm.isIgnoringBatteryOptimizations(c.getPackageName()));
+    o.put("lastFire", p.getLong("lastFire", 0));
+    o.put("lastReg", p.getLong("lastReg", 0));
+    o.put("sdk", Build.VERSION.SDK_INT);
+    call.resolve(o);
+  }
+
+  @PluginMethod
+  public void openSettings(PluginCall call) {
+    Context c = getContext();
+    String t = call.getString("type", "app");
+    String pkg = c.getPackageName();
+    try {
+      Intent i;
+      if (t.equals("notif")) {
+        i = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, pkg);
+      } else if (t.equals("full") && Build.VERSION.SDK_INT >= 34) {
+        i = new Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:" + pkg));
+      } else if (t.equals("battery") && Build.VERSION.SDK_INT >= 23) {
+        i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + pkg));
+      } else {
+        i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + pkg));
+      }
+      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+      c.startActivity(i);
+    } catch (Exception e) { }
     call.resolve();
   }
 
   @PluginMethod
   public void pending(PluginCall call) {
-    SharedPreferences p = getContext().getSharedPreferences("u", 0);
     JSObject o = new JSObject();
-    o.put("ring", p.getBoolean("ring", false));
-    o.put("t0", p.getLong("t0", 0L));
+    o.put("ring", getContext().getSharedPreferences("u", 0).getBoolean("ring", false));
     call.resolve(o);
   }
 
@@ -109,7 +194,7 @@ public class AlarmPlugin extends Plugin {
   public void clear(PluginCall call) {
     Context c = getContext();
     c.getSharedPreferences("u", 0).edit().putBoolean("ring", false).apply();
-    c.stopService(new Intent(c, AlarmService.class));
+    stopChase(c);
     ((NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE)).cancel(NID);
     call.resolve();
   }
@@ -119,24 +204,59 @@ EOF
 cat > $D/AlarmReceiver.java <<'EOF'
 package com.fahad.uthotehobe;
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.media.AudioAttributes;
+import android.media.AudioManager;
+import android.media.RingtoneManager;
 import android.os.Build;
 
 public class AlarmReceiver extends BroadcastReceiver {
   @Override
   public void onReceive(Context c, Intent i) {
-    int id = i.getIntExtra("id", 0);
     SharedPreferences p = c.getSharedPreferences("u", 0);
-    SharedPreferences.Editor e = p.edit().putBoolean("ring", true);
-    if (!p.getBoolean("ring", false)) e.putLong("t0", System.currentTimeMillis());
-    e.apply();
-    AlarmPlugin.rearm(c, id);
-    Intent s = new Intent(c, AlarmService.class);
-    if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(s);
-    else c.startService(s);
+    boolean chase = "CHASE".equals(i.getAction());
+    if (chase && !p.getBoolean("ring", false)) return;
+    p.edit().putBoolean("ring", true).putLong("lastFire", System.currentTimeMillis()).apply();
+    if (!chase) AlarmPlugin.schedule(c, i.getIntExtra("id", 0), i.getIntExtra("h", 5), i.getIntExtra("m", 0));
+    AlarmPlugin.chase(c);
+    try {
+      AudioManager au = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+      au.setStreamVolume(AudioManager.STREAM_ALARM, au.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0);
+      au.setStreamVolume(AudioManager.STREAM_MUSIC, au.getStreamMaxVolume(AudioManager.STREAM_MUSIC), 0);
+    } catch (Exception e) { }
+    NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+    if (Build.VERSION.SDK_INT >= 26) {
+      AudioAttributes a = new AudioAttributes.Builder()
+          .setUsage(AudioAttributes.USAGE_ALARM)
+          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build();
+      NotificationChannel ch = new NotificationChannel("alarm_v1", "Alarm", NotificationManager.IMPORTANCE_HIGH);
+      ch.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM), a);
+      ch.enableVibration(true);
+      nm.createNotificationChannel(ch);
+    }
+    Intent ai = new Intent(c, MainActivity.class);
+    ai.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+    PendingIntent pi = PendingIntent.getActivity(c, 3, ai, AlarmPlugin.F);
+    Notification.Builder b = Build.VERSION.SDK_INT >= 26
+        ? new Notification.Builder(c, "alarm_v1") : new Notification.Builder(c);
+    b.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+     .setContentTitle("উঠতেই হবে")
+     .setContentText("আর কত ঘুমাবি বান্দা? ওঠো, টাস্ক শেষ করো")
+     .setCategory(Notification.CATEGORY_ALARM)
+     .setPriority(Notification.PRIORITY_MAX)
+     .setFullScreenIntent(pi, true)
+     .setContentIntent(pi)
+     .setOngoing(true);
+    Notification n = b.build();
+    n.flags |= Notification.FLAG_INSISTENT;
+    nm.notify(AlarmPlugin.NID, n);
   }
 }
 EOF
@@ -147,136 +267,84 @@ package com.fahad.uthotehobe;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import java.util.Calendar;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 public class BootReceiver extends BroadcastReceiver {
   @Override
   public void onReceive(Context c, Intent i) {
-    AlarmPlugin.scheduleAll(c);
+    SharedPreferences p = c.getSharedPreferences("u", 0);
+    String json = p.getString("alarms", "[]");
+    AlarmPlugin.each(json, false, c);
+    try {
+      JSONArray a = new JSONArray(json);
+      long now = System.currentTimeMillis();
+      for (int k = 0; k < a.length(); k++) {
+        JSONObject o = a.getJSONObject(k);
+        if (!o.optBoolean("on", true)) continue;
+        Calendar cal = Calendar.getInstance();
+        cal.set(Calendar.HOUR_OF_DAY, o.getInt("h"));
+        cal.set(Calendar.MINUTE, o.getInt("m"));
+        cal.set(Calendar.SECOND, 0);
+        long t = cal.getTimeInMillis();
+        if (t <= now && now - t < 3600000) p.edit().putBoolean("ring", true).apply();
+      }
+    } catch (Exception e) { }
+    AlarmPlugin.keep(c, json.contains("\"on\":true"));
+    if (p.getBoolean("ring", false)) AlarmPlugin.chase(c);
   }
 }
 EOF
 
-cat > $D/AlarmService.java <<'EOF'
+cat > $D/KeepAliveService.java <<'EOF'
 package com.fahad.uthotehobe;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
-import android.app.PendingIntent;
 import android.app.Service;
-import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
-import android.media.AudioAttributes;
-import android.media.AudioManager;
-import android.media.MediaPlayer;
-import android.media.RingtoneManager;
-import android.net.Uri;
 import android.os.Build;
-import android.os.Handler;
 import android.os.IBinder;
-import android.os.Looper;
-import android.os.PowerManager;
-import android.os.Vibrator;
 
-@SuppressWarnings("deprecation")
-public class AlarmService extends Service {
-  static final String CH = "alarm_v2";
-  MediaPlayer mp;
-  PowerManager.WakeLock wl;
-  Vibrator vib;
-  int oldVol = -1;
-  final Handler h = new Handler(Looper.getMainLooper());
+public class KeepAliveService extends Service {
+  @Override
+  public IBinder onBind(Intent i) { return null; }
 
   @Override
-  public IBinder onBind(Intent i) {
-    return null;
-  }
-
-  @Override
-  public int onStartCommand(Intent in, int flags, int startId) {
-    Notification n = buildNotification();
-    if (Build.VERSION.SDK_INT >= 29) startForeground(AlarmPlugin.NID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
-    else startForeground(AlarmPlugin.NID, n);
-    startSound();
-    h.removeCallbacksAndMessages(null);
-    h.postDelayed(this::stopSelf, 15 * 60 * 1000L); // ব্যাটারি বাঁচাতে ১৫ মিনিট পর শব্দ থামবে
-    return START_NOT_STICKY;
-  }
-
-  Notification buildNotification() {
-    NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-    if (Build.VERSION.SDK_INT >= 26) {
-      NotificationChannel ch = new NotificationChannel(CH, "Alarm", NotificationManager.IMPORTANCE_HIGH);
-      ch.setSound(null, null); // শব্দ বাজায় সার্ভিস নিজে
-      ch.enableVibration(false);
-      ch.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
-      nm.createNotificationChannel(ch);
-    }
-    Intent ai = new Intent(this, MainActivity.class);
-    ai.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-    PendingIntent pi = PendingIntent.getActivity(this, 3, ai, AlarmPlugin.F);
-    Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CH) : new Notification.Builder(this);
-    b.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
-        .setContentTitle("উঠতেই হবে")
-        .setContentText("আর কত ঘুমাবি বান্দা? ফজরের নামাজ তোর জন্য অপেক্ষা করছে!")
-        .setCategory(Notification.CATEGORY_ALARM)
-        .setPriority(Notification.PRIORITY_MAX)
-        .setVisibility(Notification.VISIBILITY_PUBLIC)
-        .setFullScreenIntent(pi, true)
-        .setContentIntent(pi)
-        .setOngoing(true);
-    return b.build();
-  }
-
-  void startSound() {
+  public int onStartCommand(Intent i, int flags, int startId) {
     try {
-      PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-      if (wl == null) {
-        wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "uth:alarm");
-        wl.acquire(16 * 60 * 1000L);
+      NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+      if (Build.VERSION.SDK_INT >= 26) {
+        nm.createNotificationChannel(new NotificationChannel("keep_v1", "Alarm active", NotificationManager.IMPORTANCE_LOW));
       }
-    } catch (Exception e) {}
-    try {
-      AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-      if (oldVol < 0) oldVol = am.getStreamVolume(AudioManager.STREAM_ALARM);
-      am.setStreamVolume(AudioManager.STREAM_ALARM, am.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0); // সর্বোচ্চ ভলিউম
-    } catch (Exception e) {}
-    if (mp == null) {
-      try {
-        mp = new MediaPlayer();
-        mp.setAudioAttributes(new AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_ALARM)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build());
-        Uri u = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
-        if (u == null) u = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
-        mp.setDataSource(this, u);
-        mp.setLooping(true);
-        mp.setVolume(1f, 1f);
-        mp.prepare();
-        mp.start();
-      } catch (Exception e) {
-        try { if (mp != null) mp.release(); } catch (Exception x) {}
-        mp = null;
-      }
+      Notification.Builder b = Build.VERSION.SDK_INT >= 26
+          ? new Notification.Builder(this, "keep_v1") : new Notification.Builder(this);
+      b.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+       .setContentTitle("উঠতেই হবে")
+       .setContentText("এলার্ম চালু আছে")
+       .setOngoing(true)
+       .setContentIntent(AlarmPlugin.show(this));
+      Notification n = b.build();
+      if (Build.VERSION.SDK_INT >= 34) startForeground(9, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+      else startForeground(9, n);
+    } catch (Exception e) {
+      stopSelf();
     }
-    try {
-      vib = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
-      vib.vibrate(new long[] {0, 700, 400}, 0);
-    } catch (Exception e) {}
+    return START_STICKY;
   }
 
   @Override
-  public void onDestroy() {
-    h.removeCallbacksAndMessages(null);
-    try { if (mp != null) { mp.stop(); mp.release(); } } catch (Exception e) {}
-    mp = null;
-    try { if (vib != null) vib.cancel(); } catch (Exception e) {}
-    try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception e) {}
+  public void onTaskRemoved(Intent root) {
     try {
-      if (oldVol >= 0) ((AudioManager) getSystemService(Context.AUDIO_SERVICE)).setStreamVolume(AudioManager.STREAM_ALARM, oldVol, 0);
-    } catch (Exception e) {}
-    super.onDestroy();
+      SharedPreferences p = getSharedPreferences("u", 0);
+      AlarmPlugin.each(p.getString("alarms", "[]"), false, this);
+      if (p.getBoolean("ring", false)) AlarmPlugin.chase(this);
+    } catch (Exception e) { }
   }
 }
 EOF
@@ -285,13 +353,14 @@ cat > $D/MainActivity.java <<'EOF'
 package com.fahad.uthotehobe;
 
 import android.Manifest;
-import android.app.NotificationManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
 import android.provider.Settings;
+import android.view.WindowManager;
 import androidx.core.app.ActivityCompat;
 import com.getcapacitor.BridgeActivity;
 
@@ -304,20 +373,18 @@ public class MainActivity extends BridgeActivity {
       setShowWhenLocked(true);
       setTurnScreenOn(true);
     }
+    getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     String[] perms = Build.VERSION.SDK_INT >= 33
         ? new String[]{Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.CAMERA}
         : new String[]{Manifest.permission.CAMERA};
     ActivityCompat.requestPermissions(this, perms, 1);
-    // Android 14+: লক-স্ক্রিনে অ্যালার্ম স্ক্রিন দেখাতে "ফুল-স্ক্রিন নোটিফিকেশন" অনুমতি লাগে (একবারই জিজ্ঞেস করবে)
-    if (Build.VERSION.SDK_INT >= 34) {
-      SharedPreferences p = getSharedPreferences("u", 0);
-      NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-      if (!nm.canUseFullScreenIntent() && !p.getBoolean("fsiAsked", false)) {
-        p.edit().putBoolean("fsiAsked", true).apply();
-        try {
-          startActivity(new Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:" + getPackageName())));
-        } catch (Exception e) {}
-      }
+    SharedPreferences sp = getSharedPreferences("u", 0);
+    PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+    if (Build.VERSION.SDK_INT >= 23 && !pm.isIgnoringBatteryOptimizations(getPackageName()) && !sp.getBoolean("askedBat", false)) {
+      sp.edit().putBoolean("askedBat", true).apply();
+      try {
+        startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())));
+      } catch (Exception e) { }
     }
   }
 }
@@ -332,24 +399,17 @@ perms='''<uses-permission android:name="android.permission.CAMERA"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.VIBRATE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <uses-feature android:name="android.hardware.camera" android:required="false"/>
     '''
 s=s.replace('<application',perms+'<application',1)
-comps='''<receiver android:name=".AlarmReceiver" android:exported="false"/>
-    <receiver android:name=".BootReceiver" android:exported="true">
-      <intent-filter>
-        <action android:name="android.intent.action.BOOT_COMPLETED"/>
-        <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
-      </intent-filter>
-    </receiver>
-    <service android:name=".AlarmService" android:exported="false" android:foregroundServiceType="mediaPlayback"/>
-    </application>'''
-s=s.replace('</application>',comps,1)
+s=s.replace('</application>','<receiver android:name=".AlarmReceiver" android:exported="false"/>\n    <receiver android:name=".BootReceiver" android:exported="true"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/><action android:name="android.intent.action.MY_PACKAGE_REPLACED"/></intent-filter></receiver>\n    <service android:name=".KeepAliveService" android:exported="false" android:foregroundServiceType="specialUse"><property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="alarm_keepalive"/></service>\n    </application>',1)
 s=s.replace('android:name=".MainActivity"','android:name=".MainActivity" android:showWhenLocked="true" android:turnScreenOn="true"',1)
 open(p,'w',encoding='utf-8').write(s)
 PY
+
 # ---- app icon ----
 python3 -c "import PIL" 2>/dev/null || pip install -q --break-system-packages pillow
 python3 - <<'PY'
