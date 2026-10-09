@@ -5,6 +5,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      KS_B64: ${{ secrets.KS_B64 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -14,6 +16,11 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+      - name: Prepare signing key
+        run: |
+          if [ -z "$KS_B64" ]; then echo "KS_B64 secret missing"; exit 1; fi
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/uth.p12"
+          echo "KEYSTORE_PATH=$RUNNER_TEMP/uth.p12" >> "$GITHUB_ENV"
       - name: Make Android project
         run: bash patch.sh
       - name: Build APK
